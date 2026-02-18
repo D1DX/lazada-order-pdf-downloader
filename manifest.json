@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Lazada Order PDF Downloader",
-  "version": "1.0",
-  "description": "Download Lazada order detail pages as PDFs",
+  "version": "2.0",
+  "description": "Bulk download Lazada order detail pages as PDFs with date filtering, status filtering, and clean PDF output",
   "permissions": [
     "activeTab",
     "tabs",
@@ -16,6 +16,13 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://my.lazada.co.th/customer/order/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
