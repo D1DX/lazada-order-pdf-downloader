@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 360px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      color: #333;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 16px;
+      margin-bottom: 12px;
+      color: #f57224;
+    }
+    .section {
+      margin-bottom: 12px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: #555;
+    }
+    input[type="date"], input[type="number"] {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+    }
+    .row > div { flex: 1; }
+    .info {
+      background: #f0f4ff;
+      border-radius: 4px;
+      padding: 8px;
+      font-size: 11px;
+      color: #555;
+      margin-bottom: 12px;
+      line-height: 1.4;
+    }
+    .info.warning {
+      background: #fff3e0;
+      color: #8a5a00;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #startBtn {
+      background: #f57224;
+      color: white;
+    }
+    #startBtn:hover { background: #e0611a; }
+    #startBtn:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    #stopBtn {
+      background: #e53935;
+      color: white;
+      display: none;
+      margin-top: 8px;
+    }
+    #stopBtn:hover { background: #c62828; }
+    #progress {
+      display: none;
+      margin-top: 12px;
+    }
+    #progress .bar-container {
+      background: #eee;
+      border-radius: 4px;
+      height: 8px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+    #progress .bar {
+      background: #f57224;
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s;
+    }
+    #statusText {
+      font-size: 12px;
+      color: #666;
+      margin-top: 6px;
+    }
+    #log {
+      display: none;
+      margin-top: 12px;
+      max-height: 150px;
+      overflow-y: auto;
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 4px;
+      padding: 8px;
+      font-size: 11px;
+      font-family: monospace;
+      color: #555;
+    }
+    #log .entry { margin-bottom: 2px; }
+    #log .error { color: #e53935; }
+    #log .success { color: #2e7d32; }
+    .delay-section {
+      margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Lazada Order PDF Downloader</h1>
+
+  <div class="info">
+    Navigate to your Lazada "My Orders" page first, then configure and start.
+    Orders are processed newest-first. The extension checks each order's
+    date and skips orders outside your range.
+    PDFs are saved to your Downloads folder under <strong>Lazada_Orders/</strong>.
+  </div>
+
+  <div class="section">
+    <label>Date Range (order placed date)</label>
+    <div class="row">
+      <div>
+        <label>From</label>
+        <input type="date" id="dateFrom">
+      </div>
+      <div>
+        <label>To</label>
+        <input type="date" id="dateTo">
+      </div>
+    </div>
+  </div>
+
+  <div class="delay-section">
+    <label>Delay between orders (seconds)</label>
+    <input type="number" id="delay" value="3" min="1" max="30">
+  </div>
+
+  <button id="startBtn">Start Downloading PDFs</button>
+  <button id="stopBtn">Stop</button>
+
+  <div id="progress">
+    <div><strong>Progress:</strong> <span id="progressText">0 / 0</span></div>
+    <div class="bar-container"><div class="bar" id="progressBar"></div></div>
+    <div id="statusText">Initializing...</div>
+  </div>
+
+  <div id="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
