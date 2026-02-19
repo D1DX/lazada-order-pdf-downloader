@@ -1,5 +1,5 @@
 // Content script: Injects a floating button on Lazada order pages
-// to quickly open the extension popup.
+// to quickly open the extension side panel.
 
 (function() {
   // Only inject on order-related pages
@@ -53,45 +53,7 @@
   document.body.appendChild(btn);
 
   btn.addEventListener('click', () => {
-    // Open the extension popup by sending a message to the background
-    // Since we can't programmatically open the popup, we show a small tooltip
-    // telling the user to click the extension icon, OR we can use the action API
-    chrome.runtime.sendMessage({ action: 'openPopup' });
-
-    // Show a brief tooltip since chrome.action.openPopup() isn't available from content scripts
-    const tooltip = document.createElement('div');
-    tooltip.textContent = 'Click the extension icon in your toolbar to open PDF Downloader';
-    tooltip.style.cssText = `
-      position: fixed;
-      bottom: 80px;
-      right: 24px;
-      z-index: 999999;
-      background: #333;
-      color: white;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 12px;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-      max-width: 250px;
-      animation: fadeInOut 3s ease forwards;
-    `;
-
-    const fadeStyle = document.createElement('style');
-    fadeStyle.textContent = `
-      @keyframes fadeInOut {
-        0% { opacity: 0; transform: translateY(10px); }
-        15% { opacity: 1; transform: translateY(0); }
-        85% { opacity: 1; transform: translateY(0); }
-        100% { opacity: 0; transform: translateY(-10px); }
-      }
-    `;
-    document.head.appendChild(fadeStyle);
-    document.body.appendChild(tooltip);
-
-    setTimeout(() => {
-      tooltip.remove();
-      fadeStyle.remove();
-    }, 3200);
+    // Ask background to open the side panel
+    chrome.runtime.sendMessage({ action: 'openSidePanel' });
   });
 })();

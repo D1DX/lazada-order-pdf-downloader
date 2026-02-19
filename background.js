@@ -10,6 +10,7 @@ let state = {
 };
 
 function log(text, logType = '') {
+  console.log(`[LazadaPDF] ${text}`);
   chrome.runtime.sendMessage({ type: 'log', text, logType }).catch(() => {});
 }
 
@@ -25,8 +26,22 @@ function sendProgress(status) {
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  // Interruptible sleep - checks state.stopped every 200ms
+  return new Promise(resolve => {
+    if (ms <= 0) { resolve(); return; }
+    const start = Date.now();
+    const interval = setInterval(() => {
+      if (state.stopped || Date.now() - start >= ms) {
+        clearInterval(interval);
+        resolve();
+      }
+    }, Math.min(200, ms));
+  });
 }
+
+// --- Side Panel: open on toolbar icon click ---
+// This keeps the extension visible at all times while running
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 // --- Navigation & Login Detection ---
 const ORDERS_URL = 'https://my.lazada.co.th/customer/order/index/';
@@ -41,18 +56,15 @@ function isLoginPage(url) {
 }
 
 async function navigateToOrders(tabId, currentUrl) {
-  // If already on orders page, nothing to do
   if (isOrdersPage(currentUrl)) {
     return { ok: true, tabId };
   }
 
-  // Navigate the current tab to orders page
   log('Navigating to Lazada My Orders page...');
   await chrome.tabs.update(tabId, { url: ORDERS_URL });
   await waitForTabLoad(tabId);
   await sleep(2000);
 
-  // Check if we ended up on login page
   const tab = await chrome.tabs.get(tabId);
   if (isLoginPage(tab.url)) {
     log('Login required. Please log in to Lazada first.', 'error');
@@ -60,7 +72,6 @@ async function navigateToOrders(tabId, currentUrl) {
     return { ok: false, needLogin: true };
   }
 
-  // Verify we're on orders page
   if (!isOrdersPage(tab.url)) {
     log('Could not navigate to orders page. Please navigate manually.', 'error');
     return { ok: false };
@@ -70,8 +81,180 @@ async function navigateToOrders(tabId, currentUrl) {
   return { ok: true, tabId };
 }
 
+// --- Navigate to a specific page number ---
+async function goToPageNumber(tabId, targetPage) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: (target) => {
+      // Helper: set input value using native setter to bypass React
+      function setInputValue(input, value) {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeInputValueSetter.call(input, String(value));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      // Helper: fire Enter key events
+      function pressEnter(input) {
+        input.focus();
+        for (const evtType of ['keydown', 'keypress', 'keyup']) {
+          input.dispatchEvent(new KeyboardEvent(evtType, {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+          }));
+        }
+      }
+
+      // Helper: find a clickable "Go" button near a given element
+      // Searches siblings and parent's children for a button-like element with text "Go"
+      function findGoButton(nearElement) {
+        // Search from the nearest pagination ancestor
+        let searchRoot = nearElement.parentElement;
+        for (let i = 0; i < 5 && searchRoot; i++) {
+          // Look for buttons, links, spans with text "Go" (exact match only)
+          const candidates = searchRoot.querySelectorAll('button, a, span, div');
+          for (const el of candidates) {
+            // Check DIRECT text content (not children's text) to avoid matching "Go to" label
+            const directText = Array.from(el.childNodes)
+              .filter(n => n.nodeType === Node.TEXT_NODE)
+              .map(n => n.textContent.trim())
+              .join('')
+              .toLowerCase();
+            // Also check full trimmed text for simple elements with no children
+            const fullText = el.textContent.trim().toLowerCase();
+            const hasChildren = el.children.length > 0;
+
+            if (directText === 'go' || (!hasChildren && fullText === 'go')) {
+              return el;
+            }
+          }
+          searchRoot = searchRoot.parentElement;
+        }
+
+        // Fallback: search the entire document for any element that's just "Go" text
+        // near a pagination context
+        const allElements = document.querySelectorAll('button, a, span[role="button"], div[role="button"]');
+        for (const el of allElements) {
+          const text = el.textContent.trim().toLowerCase();
+          if (text === 'go' && el.offsetParent !== null) {
+            // Make sure it's visible and near pagination area
+            return el;
+          }
+        }
+        return null;
+      }
+
+      // --- Search for pagination container (try multiple selectors) ---
+      const pagSelectors = [
+        '.order-pagination',
+        '[class*="pagination"]',
+        '.next-pagination',
+        '[class*="pager"]'
+      ];
+      let pag = null;
+      for (const sel of pagSelectors) {
+        pag = document.querySelector(sel);
+        if (pag) break;
+      }
+      if (!pag) return { ok: false, reason: 'no-pagination' };
+
+      // Strategy 1: Try clicking the page number button directly if visible
+      const pageButtons = [...pag.querySelectorAll('button, li, a')];
+      for (const btn of pageButtons) {
+        const text = btn.textContent.trim();
+        if (text === String(target) && !btn.className.includes('current') && !btn.className.includes('active')) {
+          btn.click();
+          return { ok: true, method: 'button-click' };
+        }
+      }
+
+      // Strategy 2: Find "Go to" input and "Go" button
+      // Search broadly - the Go input might be a sibling/cousin of the pagination, not inside it
+      // First search inside pagination, then search the pagination's parent containers
+      let goInput = null;
+      let searchAreas = [pag];
+      // Also add parent and grandparent to search area
+      if (pag.parentElement) searchAreas.push(pag.parentElement);
+      if (pag.parentElement && pag.parentElement.parentElement) {
+        searchAreas.push(pag.parentElement.parentElement);
+      }
+
+      for (const area of searchAreas) {
+        const inputs = area.querySelectorAll('input');
+        for (const inp of inputs) {
+          const type = inp.type.toLowerCase();
+          if (type === 'number' || type === 'text' || type === 'tel' || type === '') {
+            goInput = inp;
+            break;
+          }
+        }
+        if (goInput) break;
+      }
+
+      if (!goInput) {
+        // Last resort: find any input near text "Go to" in the whole page
+        const allInputs = document.querySelectorAll('input[type="number"], input[type="text"], input[type="tel"], input:not([type])');
+        for (const inp of allInputs) {
+          const parentText = (inp.parentElement?.textContent || '').toLowerCase();
+          if (parentText.includes('go to') || parentText.includes('page')) {
+            goInput = inp;
+            break;
+          }
+        }
+      }
+
+      if (goInput) {
+        // Set the value
+        setInputValue(goInput, target);
+
+        // Find and click the "Go" button
+        const goBtn = findGoButton(goInput);
+        if (goBtn) {
+          goBtn.click();
+          return { ok: true, method: 'go-button', debug: `Found Go btn tag=${goBtn.tagName} text="${goBtn.textContent.trim()}"` };
+        }
+
+        // No Go button found - try Enter key as fallback
+        pressEnter(goInput);
+        return { ok: true, method: 'enter-key', debug: 'Go button not found, used Enter key' };
+      }
+
+      // Strategy 3: Broader jump input selectors
+      const jumpInput = document.querySelector(
+        '.next-pagination-jump input, [class*="jump"] input, ' +
+        '[class*="pagination"] input'
+      );
+      if (jumpInput) {
+        setInputValue(jumpInput, target);
+        const goBtn = findGoButton(jumpInput);
+        if (goBtn) {
+          goBtn.click();
+          return { ok: true, method: 'jump-go-button' };
+        }
+        pressEnter(jumpInput);
+        return { ok: true, method: 'jump-enter-key' };
+      }
+
+      return { ok: false, reason: 'no-input-found', debug: `Searched ${searchAreas.length} areas, pag class="${pag.className}"` };
+    },
+    args: [targetPage]
+  });
+
+  const result = results[0]?.result;
+  if (result) {
+    if (result.ok) {
+      log(`Page jump: navigated to page ${targetPage} via ${result.method}${result.debug ? ' (' + result.debug + ')' : ''}`);
+    } else {
+      log(`Page jump failed: ${result.reason}${result.debug ? ' (' + result.debug + ')' : ''}`, 'error');
+    }
+    return result.ok;
+  }
+  return false;
+}
+
 // --- Extract order links from the order list page ---
-// Uses world: 'MAIN' to access React fiber props on DOM elements
 async function extractOrdersFromPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
@@ -95,7 +278,6 @@ async function extractOrdersFromPage(tabId) {
 
         if (!shopGroupKey || !tradeOrderId) continue;
 
-        // Deduplicate by composite key (shopGroupKey + tradeOrderId)
         const dedupeKey = `${shopGroupKey}_${tradeOrderId}`;
         if (seen.has(dedupeKey)) continue;
         seen.add(dedupeKey);
@@ -157,7 +339,9 @@ async function goToNextPage(tabId) {
 
 async function waitForPageLoad(tabId, previousFirstOrder) {
   for (let i = 0; i < 20; i++) {
+    if (state.stopped) return false;
     await sleep(500);
+    if (state.stopped) return false;
     const orders = await extractOrdersFromPage(tabId);
     if (orders.length > 0) {
       if (!previousFirstOrder || orders[0].shopGroupKey !== previousFirstOrder) {
@@ -168,55 +352,306 @@ async function waitForPageLoad(tabId, previousFirstOrder) {
   return false;
 }
 
-// --- CSS Injection to clean up order detail page before PDF ---
+// --- Get the date of the first order on a given page ---
+// This opens a detail tab to check the date, then closes it.
+// Returns the date string or null.
+async function sampleDateFromPage(tabId, orders) {
+  if (!orders || orders.length === 0) return null;
+  const order = orders[0];
+  const baseUrl = 'https://my.lazada.co.th/customer/order/view/';
+  const url = `${baseUrl}?shopGroupKey=${encodeURIComponent(order.shopGroupKey)}&tradeOrderId=${encodeURIComponent(order.tradeOrderId)}`;
+
+  let detailTabId = null;
+  try {
+    const tab = await chrome.tabs.create({ url, active: false });
+    detailTabId = tab.id;
+    await waitForTabLoad(detailTabId);
+    await sleep(2000);
+
+    const dateResults = await chrome.scripting.executeScript({
+      target: { tabId: detailTabId },
+      func: () => {
+        const text = document.body.innerText;
+        const match = text.match(/Placed on\s+(\d{1,2}\s+\w+\s+\d{4})/);
+        return match ? match[1] : null;
+      }
+    });
+
+    return dateResults[0]?.result || null;
+  } catch (e) {
+    return null;
+  } finally {
+    if (detailTabId) {
+      try { await chrome.tabs.remove(detailTabId); } catch (_) {}
+    }
+  }
+}
+
+// --- Smart page finder using binary search ---
+// Orders are sorted newest-first. We want to find the first page
+// that contains orders within our date range.
+// Returns the page number to start from.
+async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
+  if (!dateTo || totalPages <= 2) return 1;
+
+  log(`Smart navigation: searching ${totalPages} pages for date range start...`);
+  sendProgress('Smart navigation: finding the right page...');
+
+  // Check page 1 first - if the newest orders are already in range, start from page 1
+  const page1Orders = await extractOrdersFromPage(tabId);
+  const page1Date = await sampleDateFromPage(tabId, page1Orders);
+
+  if (page1Date) {
+    log(`Page 1 first order date: ${page1Date}`);
+    if (dateTo && isDateBeforeRange(page1Date, dateTo)) {
+      // Page 1 orders are AFTER our dateTo? No, isDateBeforeRange checks if date < from.
+      // We need: if page1Date > dateTo, all orders are too new... but orders are newest-first
+      // so page 1 is the newest. If page1 date is within range, start here.
+    }
+    // If page 1 date is within our range, just start from page 1
+    if (isDateInRange(page1Date, dateFrom, dateTo)) {
+      log('Page 1 already contains orders in range. Starting from page 1.', 'success');
+      return 1;
+    }
+    // If page 1 date is AFTER dateTo (orders newer than our range), we need to go forward
+    const d = parseDate(page1Date);
+    const to = dateTo ? new Date(dateTo + 'T23:59:59') : null;
+    if (d && to && d > to) {
+      log(`Page 1 orders (${page1Date}) are newer than ${dateTo}. Searching deeper...`);
+      // Binary search: find the page where dates fall into range
+      let lo = 1, hi = totalPages;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        log(`Binary search: checking page ${mid}/${totalPages}...`);
+        sendProgress(`Smart search: checking page ${mid}/${totalPages}...`);
+
+        // Navigate to page mid
+        const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+        const jumped = await goToPageNumber(tabId, mid);
+        if (jumped) {
+          await waitForPageLoad(tabId, prevFirst);
+          await sleep(1000);
+        } else {
+          // Can't jump, fall back to sequential from page 1
+          log('Cannot jump to page directly. Will scan sequentially.', 'error');
+          // Navigate back to page 1
+          const pf = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+          await goToPageNumber(tabId, 1);
+          await waitForPageLoad(tabId, pf);
+          await sleep(1000);
+          return 1;
+        }
+
+        const midOrders = await extractOrdersFromPage(tabId);
+        const midDate = await sampleDateFromPage(tabId, midOrders);
+
+        if (!midDate) {
+          // Can't determine date, be safe and go left
+          hi = mid;
+          continue;
+        }
+
+        log(`Page ${mid} first order date: ${midDate}`);
+        const midD = parseDate(midDate);
+
+        if (midD && to && midD > to) {
+          // Still too new, go right (deeper into older orders)
+          lo = mid + 1;
+        } else {
+          // This page or earlier might be our start
+          hi = mid;
+        }
+      }
+
+      // Navigate to the found page
+      // Go back one page to be safe (might have orders spanning the boundary)
+      const startPage = Math.max(1, lo - 1);
+      log(`Smart navigation: starting from page ${startPage}.`, 'success');
+
+      const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+      await goToPageNumber(tabId, startPage);
+      await waitForPageLoad(tabId, prevFirst2);
+      await sleep(1000);
+
+      return startPage;
+    }
+  }
+
+  return 1;
+}
+
+// --- Cleanup: DOM removal + CSS to prepare page for PDF ---
 async function injectCleanupCSS(tabId, options) {
+
+  // STEP 1: Run JS in MAIN world to physically REMOVE elements from the DOM.
+  // This is far more reliable than CSS hiding because removed elements
+  // don't occupy any layout space, so remaining content naturally expands.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: (opts) => {
+        // Helper: remove element from DOM
+        function nuke(el) { if (el && el.parentNode) el.parentNode.removeChild(el); }
+
+        // Helper: remove all matching selectors
+        function nukeAll(selector) {
+          document.querySelectorAll(selector).forEach(nuke);
+        }
+
+        // --- ALWAYS remove our injected PDF button ---
+        nuke(document.getElementById('lazada-pdf-ext-btn'));
+
+        // --- Remove sidebar ---
+        if (opts.cutSideMenu) {
+          // 1. Direct approach: find the element containing "Manage My Account" text
+          //    and walk up to find its container to remove
+          const walker = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT, null, false
+          );
+          const sidebarTexts = ['Manage My Account', 'My Wishlist', 'Sell On Lazada'];
+          const elementsToRemove = new Set();
+
+          while (walker.nextNode()) {
+            const text = walker.currentNode.textContent.trim();
+            for (const st of sidebarTexts) {
+              if (text === st) {
+                // Walk up to find a substantial container (not just a span)
+                let el = walker.currentNode.parentElement;
+                for (let i = 0; i < 10 && el; i++) {
+                  const w = el.offsetWidth || 0;
+                  const h = el.offsetHeight || 0;
+                  // Sidebar is typically 150-250px wide, full height
+                  if (w > 100 && w < 350 && h > 200) {
+                    elementsToRemove.add(el);
+                    break;
+                  }
+                  el = el.parentElement;
+                }
+              }
+            }
+          }
+          elementsToRemove.forEach(nuke);
+
+          // 2. Selector-based removal for common sidebar patterns
+          nukeAll([
+            '.left-content', '.my-account-left', '.account-sidebar',
+            '.sidebar', '.left-sidebar', '.nav-sidebar',
+            '.my-lazada-sidebar', '.lzd-aside', '.account-left',
+            '.ant-layout-sider',
+            '[class*="sidebar" i]', '[class*="left-nav" i]',
+            '[class*="account-left" i]', '[class*="account-menu" i]',
+            '[class*="side-menu" i]', '[class*="layout-sider" i]',
+            '[data-spm*="sidebar"]', '[data-spm*="leftmenu"]'
+          ].join(','));
+
+          // 3. Only fix the direct layout ancestors that held sidebar + content
+          //    Walk UP from the main content area, not down through all elements
+          const mainContent = document.querySelector(
+            '[class*="right-content" i], [class*="account-right" i], ' +
+            '[class*="order-detail" i], [class*="account-content" i]'
+          );
+          if (mainContent) {
+            let el = mainContent;
+            while (el && el !== document.body) {
+              const cs = window.getComputedStyle(el);
+              // Only fix large left margins/paddings on direct ancestors
+              const ml = parseFloat(cs.marginLeft) || 0;
+              if (ml > 150) el.style.marginLeft = '0px';
+              // Remove max-width constraints
+              const mw = parseFloat(cs.maxWidth);
+              if (mw > 0 && mw < window.innerWidth) el.style.maxWidth = '100%';
+              el = el.parentElement;
+            }
+          }
+        }
+
+        // --- Remove ads ---
+        if (opts.cutAds) {
+          nukeAll([
+            '.pdp-block', '.recommend', '.J_SimilarProduct', '.banner',
+            '[class*="recommend" i]', '[class*="promotion" i]', '[class*="banner" i]',
+            '[class*="advert" i]', '[class*="campaign" i]',
+            '[data-spm*="recommend"]', '.J_DC_coupon',
+            '.order-detail-bottom-recommend', '.pdp-mod-recommend',
+            '.mod-order-detail-recommend', '.detail-recommend',
+            'iframe[src*="ad"]', '.ads-container'
+          ].join(','));
+        }
+
+        // --- Remove header ---
+        if (opts.cutHeader) {
+          nukeAll([
+            '#topActionHeader', '.lzd-header', 'header', '.top-bar',
+            '[class*="header-wrap" i]', '[class*="top-bar" i]',
+            '.lzd-site-top', '#asc_header', '.next-overlay-wrapper',
+            'nav[class*="header" i]',
+            '[class*="lazada-header" i]'
+          ].join(','));
+        }
+
+        // --- Remove footer ---
+        if (opts.cutFooter) {
+          nukeAll([
+            'footer', '.footer', '.lzd-footer',
+            '[class*="footer" i]',
+            '.site-footer', '.page-footer',
+            '.lzd-site-bottom', '[class*="bottom-bar" i]',
+            '[data-spm*="footer"]'
+          ].join(','));
+        }
+
+      },
+      args: [options]
+    });
+  } catch (e) {
+    log(`DOM cleanup warning: ${e.message}`, 'error');
+  }
+
+  // STEP 2: Apply CSS to expand content after sidebar removal.
+  // Be careful not to override ALL widths which breaks internal layouts.
   const cssRules = [];
 
-  if (options.cutAds) {
-    // Hide ads, promotions, banners, recommended sections
-    cssRules.push(`
-      .pdp-block, .recommend, .J_SimilarProduct, .banner,
-      [class*="recommend"], [class*="promotion"], [class*="banner"],
-      [class*="advert"], [class*="Advert"], [class*="campaign"],
-      [data-spm*="recommend"], .J_DC_coupon,
-      .order-detail-bottom-recommend, .pdp-mod-recommend,
-      .mod-order-detail-recommend, .detail-recommend,
-      iframe[src*="ad"], .ads-container { display: none !important; }
-    `);
-  }
+  cssRules.push(`
+    /* Hide our injected button in print */
+    #lazada-pdf-ext-btn { display: none !important; }
 
-  if (options.cutSideMenu) {
-    // Hide left sidebar / navigation
-    cssRules.push(`
-      .left-content, .my-account-left, .account-sidebar,
-      .sidebar, .left-sidebar, .nav-sidebar,
-      [class*="sidebar"], [class*="left-nav"],
-      .my-lazada-sidebar { display: none !important; }
-      .right-content, .main-content, .my-account-right,
-      [class*="right-content"], [class*="main-content"] {
-        width: 100% !important;
-        margin-left: 0 !important;
-        padding-left: 0 !important;
-      }
-    `);
-  }
+    /* Basic page reset */
+    body, html {
+      overflow-x: hidden !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
 
-  if (options.cutHeader) {
-    // Hide page header / top navigation
-    cssRules.push(`
-      #topActionHeader, .lzd-header, header, .top-bar,
-      [class*="header-wrap"], [class*="top-bar"],
-      .lzd-site-top, #asc_header, .next-overlay-wrapper,
-      nav[class*="header"] { display: none !important; }
-    `);
-  }
+    /* Expand the main content area that was next to sidebar */
+    [class*="right-content" i], [class*="account-right" i],
+    [class*="account-content" i] {
+      width: 100% !important;
+      max-width: 100% !important;
+      margin-left: 0 !important;
+      box-sizing: border-box !important;
+    }
 
-  if (cssRules.length > 0) {
-    await chrome.scripting.insertCSS({
-      target: { tabId },
-      css: cssRules.join('\n')
-    });
-  }
+    /* Remove max-width constraints on top-level layout wrappers only */
+    body > div > [class*="container" i],
+    body > div > [class*="wrapper" i],
+    body > [class*="container" i],
+    body > [class*="wrapper" i] {
+      max-width: 100% !important;
+    }
+
+    /* Print optimizations */
+    @media print {
+      body { margin: 0 !important; padding: 0 !important; }
+      #lazada-pdf-ext-btn { display: none !important; }
+    }
+    @page { margin: 0; }
+  `);
+
+  await chrome.scripting.insertCSS({
+    target: { tabId },
+    css: cssRules.join('\n')
+  });
 }
 
 // --- Print tab to PDF ---
@@ -229,33 +664,40 @@ async function printTabToPDF(tabId, filename, fitOnePage) {
       preferCSSPageSize: false,
       paperWidth: 8.27,   // A4
       paperHeight: 11.69,  // A4
-      marginTop: 0.4,
-      marginBottom: 0.4,
-      marginLeft: 0.4,
-      marginRight: 0.4
+      marginTop: 0.3,
+      marginBottom: 0.3,
+      marginLeft: 0.3,
+      marginRight: 0.3
     };
 
     if (fitOnePage) {
-      // Get the page content height to calculate scale
+      // Get the content layout metrics at the current viewport
       const metrics = await chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics');
       if (metrics && metrics.contentSize) {
         const contentHeight = metrics.contentSize.height;
-        // Available print height in inches (A4 minus margins)
-        const availableHeight = (11.69 - 0.8) * 96; // ~1045 pixels
-        const availableWidth = (8.27 - 0.8) * 96;  // ~717 pixels
         const contentWidth = metrics.contentSize.width;
 
-        // Calculate scale to fit content on one page
-        const scaleY = availableHeight / contentHeight;
-        const scaleX = availableWidth / contentWidth;
-        const scale = Math.min(scaleX, scaleY, 1); // Don't upscale
+        // Available print area in inches (A4 with margins)
+        const availableWidthIn = 8.27 - 0.6;  // ~7.67in
+        const availableHeightIn = 11.69 - 0.6; // ~11.09in
+        const availableWidthPx = availableWidthIn * 96;  // ~737px
+        const availableHeightPx = availableHeightIn * 96; // ~1065px
 
-        if (scale < 1 && scale > 0.3) {
-          pdfOptions.scale = scale;
-        } else if (scale <= 0.3) {
-          // Content is too tall even at minimum scale, just use a long page
-          pdfOptions.paperHeight = (contentHeight / 96) + 0.8;
+        // Only scale DOWN, never up — scaling up causes overlapping
+        const scaleX = availableWidthPx / contentWidth;
+        const scaleY = availableHeightPx / contentHeight;
+        let scale = Math.min(scaleX, scaleY);
+        scale = Math.min(scale, 1.0);  // NEVER scale up
+        scale = Math.max(scale, 0.3);  // Don't go too tiny
+
+        if (contentHeight * scale > availableHeightPx) {
+          // Even after scaling, content is taller than one A4 page
+          // Use a taller paper to fit everything
+          const neededHeightIn = (contentHeight * scale) / 96 + 0.6;
+          pdfOptions.paperHeight = neededHeightIn;
         }
+
+        pdfOptions.scale = scale;
       }
     }
 
@@ -279,24 +721,32 @@ async function printTabToPDF(tabId, filename, fitOnePage) {
 
 function waitForTabLoad(tabId) {
   return new Promise((resolve) => {
+    let resolved = false;
+    function done() {
+      if (resolved) return;
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearInterval(stopCheck);
+      clearTimeout(timeout);
+      resolve();
+    }
     function listener(updatedTabId, changeInfo) {
       if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
+        done();
       }
     }
     chrome.tabs.onUpdated.addListener(listener);
-    setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    }, 30000);
+    // Check for stop every 200ms so stop button responds quickly
+    const stopCheck = setInterval(() => {
+      if (state.stopped) done();
+    }, 200);
+    const timeout = setTimeout(done, 30000);
   });
 }
 
 // --- Date helpers ---
 function parseDate(dateStr) {
   if (!dateStr) return null;
-  // "12 Feb 2026" or "12 Feb 2026 14:30:00" format
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return null;
   return d;
@@ -314,7 +764,7 @@ function formatDateForFilename(dateStr) {
 function isDateInRange(dateStr, dateFrom, dateTo) {
   if (!dateFrom && !dateTo) return true;
   const d = parseDate(dateStr);
-  if (!d) return true; // If we can't parse, include it
+  if (!d) return true;
 
   if (dateFrom) {
     const from = new Date(dateFrom + 'T00:00:00');
@@ -343,7 +793,6 @@ function sanitizeFilename(str) {
 function isStatusExcluded(orderStatus, excludedStatuses) {
   if (!excludedStatuses || excludedStatuses.length === 0) return false;
   if (!orderStatus) {
-    // Unknown status - check if "Other" is excluded
     return excludedStatuses.includes('Other');
   }
 
@@ -356,7 +805,6 @@ function isStatusExcluded(orderStatus, excludedStatuses) {
     }
   }
 
-  // If status doesn't match any known category, check "Other"
   const knownStatuses = ['delivered', 'completed', 'in transit', 'pending', 'cancelled', 'returned'];
   const isKnown = knownStatuses.some(k => statusLower.includes(k));
   if (!isKnown && excludedStatuses.includes('Other')) {
@@ -367,7 +815,7 @@ function isStatusExcluded(orderStatus, excludedStatuses) {
 }
 
 // --- Main process ---
-async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, options) {
+async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
   state.running = true;
   state.stopped = false;
   state.downloaded = 0;
@@ -387,25 +835,57 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
 
     state.listTabId = tabId;
 
-    // Global dedup set across all pages
+    // Log filter configuration
+    log(`--- Filter Configuration ---`);
+    log(`Date range: ${dateFrom || 'any'} to ${dateTo || 'any'}`);
+    log(`Excluded statuses: ${options.excludedStatuses.length > 0 ? options.excludedStatuses.join(', ') : 'none'}`);
+    log(`PDF options: ${[
+      options.cutAds ? 'no-ads' : '',
+      options.cutSideMenu ? 'no-sidebar' : '',
+      options.cutHeader ? 'no-header' : '',
+      options.cutFooter ? 'no-footer' : '',
+      options.fitOnePage ? 'fit-one-page' : ''
+    ].filter(Boolean).join(', ')}`);
+    log(`Delay: ${delayMs}ms between orders`);
+    log(`Duplicates: tracked in memory (resets on extension restart)`);
+    log(`----------------------------`);
+
     const globalSeen = new Set();
 
     const { totalPages } = await getPaginationInfo(tabId);
-    log(`Found ${totalPages} pages of orders.`);
+    log(`Found ${totalPages} page${totalPages > 1 ? 's' : ''} of orders.`);
 
-    let pageNum = 1;
+    // Smart navigation: jump to the right page range
+    let startPage = 1;
+    if (totalPages > 2 && dateTo) {
+      startPage = await findStartPage(tabId, dateFrom, dateTo, totalPages);
+    }
+
+    let pageNum = startPage;
     let reachedEndOfRange = false;
 
-    while (pageNum <= totalPages && !state.stopped && !reachedEndOfRange) {
-      log(`Processing page ${pageNum}/${totalPages}...`);
-      sendProgress(`Scanning page ${pageNum}/${totalPages}...`);
+    // If we jumped to a page > 1, we need to navigate there
+    if (startPage > 1) {
+      const { currentPage } = await getPaginationInfo(tabId);
+      if (currentPage !== startPage) {
+        const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+        await goToPageNumber(tabId, startPage);
+        await waitForPageLoad(tabId, prevFirst);
+        await sleep(1000);
+      }
+    }
 
-      // Navigate to next page if needed
-      if (pageNum > 1) {
+    while (pageNum <= totalPages && !state.stopped && !reachedEndOfRange) {
+      const pageLabel = `page ${pageNum}/${totalPages}`;
+      log(`--- Processing ${pageLabel} ---`);
+      sendProgress(`Scanning ${pageLabel}...`);
+
+      // Navigate to next page if needed (skip for first iteration)
+      if (pageNum > startPage) {
         const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
         const navigated = await goToNextPage(tabId);
         if (!navigated) {
-          log('Could not navigate to next page.', 'error');
+          log(`Could not navigate to next page after page ${pageNum - 1}.`, 'error');
           break;
         }
         await waitForPageLoad(tabId, prevFirst);
@@ -413,10 +893,10 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
       }
 
       const orders = await extractOrdersFromPage(tabId);
-      log(`Found ${orders.length} orders on page ${pageNum}.`);
+      log(`Found ${orders.length} order${orders.length !== 1 ? 's' : ''} on ${pageLabel}.`);
 
       if (orders.length === 0) {
-        log('No orders found on this page, stopping.');
+        log('No orders found on this page. Stopping.');
         break;
       }
 
@@ -424,25 +904,27 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
         if (state.stopped) break;
 
         const order = orders[i];
+        const orderLabel = `[${pageLabel}, #${i + 1}/${orders.length}] ${order.tradeOrderId}`;
 
-        // Global dedup by tradeOrderId (the actual order identifier)
+        // Global dedup (in-memory only - resets on extension restart)
         if (globalSeen.has(order.tradeOrderId)) {
-          log(`Order ${order.tradeOrderId} already processed, skipping duplicate.`);
+          log(`${orderLabel} - duplicate, skipping.`);
           state.skipped++;
-          sendProgress(`Page ${pageNum}: skipping duplicate ${order.tradeOrderId}`);
+          sendProgress(`${pageLabel}: skip dup ${order.tradeOrderId}`);
           continue;
         }
         globalSeen.add(order.tradeOrderId);
 
-        // Check status filter from order list data
+        // Status filter
         if (isStatusExcluded(order.status, options.excludedStatuses)) {
-          log(`Order ${order.tradeOrderId} status "${order.status}" excluded, skipping.`);
+          log(`${orderLabel} - status "${order.status}" excluded, skipping.`);
           state.skipped++;
-          sendProgress(`Page ${pageNum}: skipping ${order.tradeOrderId} (${order.status})`);
+          sendProgress(`${pageLabel}: skip ${order.tradeOrderId} (${order.status})`);
           continue;
         }
 
-        sendProgress(`Page ${pageNum}: checking order ${i + 1}/${orders.length} (${order.shopName})`);
+        if (state.stopped) break;
+        sendProgress(`${pageLabel}: checking ${order.shopName} (${order.tradeOrderId})`);
 
         let detailTabId = null;
         try {
@@ -453,9 +935,14 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
           detailTabId = tab.id;
 
           await waitForTabLoad(detailTabId);
-          await sleep(2500); // Wait for React to render
+          await sleep(2500);
 
-          // Get the placed date from detail page
+          if (state.stopped) {
+            try { await chrome.tabs.remove(detailTabId); } catch (_) {}
+            break;
+          }
+
+          // Get placed date
           const dateResults = await chrome.scripting.executeScript({
             target: { tabId: detailTabId },
             func: () => {
@@ -466,11 +953,11 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
           });
 
           const orderDate = dateResults[0]?.result;
-          log(`Order ${order.tradeOrderId} (${order.shopName}): placed ${orderDate || 'unknown'}`);
+          log(`${orderLabel} - "${order.shopName}" placed ${orderDate || 'unknown date'}, status: ${order.status || 'unknown'}`);
 
-          // Early stop: if date is before range start (orders are newest-first)
+          // Early stop
           if (orderDate && isDateBeforeRange(orderDate, dateFrom)) {
-            log(`Order date ${orderDate} is before range start ${dateFrom}. Stopping early.`, 'success');
+            log(`${orderLabel} - date ${orderDate} is before range start ${dateFrom}. All remaining orders are older. Stopping.`, 'success');
             reachedEndOfRange = true;
             try { await chrome.tabs.remove(detailTabId); } catch (_) {}
             break;
@@ -478,17 +965,20 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
 
           // Skip if outside date range
           if (!isDateInRange(orderDate, dateFrom, dateTo)) {
-            log(`Order date ${orderDate} is outside range, skipping.`);
+            const reason = orderDate
+              ? `date ${orderDate} outside range ${dateFrom || '*'} to ${dateTo || '*'}`
+              : 'could not determine date';
+            log(`${orderLabel} - ${reason}, skipping.`);
             state.skipped++;
-            sendProgress(`Page ${pageNum}: skipping ${order.tradeOrderId} (date out of range)`);
+            sendProgress(`${pageLabel}: skip ${order.tradeOrderId} (out of date range)`);
             try { await chrome.tabs.remove(detailTabId); } catch (_) {}
             await sleep(500);
             continue;
           }
 
-          // Date is in range - apply CSS cleanup and print to PDF
+          // In range - apply CSS and print PDF
           await injectCleanupCSS(detailTabId, options);
-          await sleep(300); // Let CSS apply
+          await sleep(800); // Wait for DOM removal + CSS reflow before PDF
 
           const dateForFile = formatDateForFilename(orderDate);
           const shopClean = sanitizeFilename(order.shopName) || 'shop';
@@ -498,19 +988,18 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
 
           await printTabToPDF(detailTabId, filename, options.fitOnePage);
           state.downloaded++;
-          log(`Saved: ${filename}`, 'success');
-          sendProgress(`Saved ${state.downloaded} PDFs (page ${pageNum})`);
+          log(`${orderLabel} - SAVED: ${filename}`, 'success');
+          sendProgress(`Saved ${state.downloaded} PDFs (${pageLabel})`);
 
           try { await chrome.tabs.remove(detailTabId); } catch (_) {}
           detailTabId = null;
 
-          // Delay between orders
-          if (delaySeconds > 0) {
-            await sleep(delaySeconds * 1000);
+          if (delayMs > 0) {
+            await sleep(delayMs);
           }
 
         } catch (err) {
-          log(`Error processing order ${order.tradeOrderId}: ${err.message}`, 'error');
+          log(`${orderLabel} - ERROR: ${err.message}`, 'error');
           if (detailTabId) {
             try { await chrome.tabs.remove(detailTabId); } catch (_) {}
           }
@@ -518,12 +1007,20 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delaySeconds, optio
         }
       }
 
-      state.pagesProcessed = pageNum;
-      sendProgress(`Completed page ${pageNum}/${totalPages}`);
+      state.pagesProcessed++;
+      sendProgress(`Completed ${pageLabel}`);
       pageNum++;
     }
 
     state.running = false;
+
+    // Summary
+    log(`--- Summary ---`);
+    log(`Total PDFs saved: ${state.downloaded}`);
+    log(`Total skipped: ${state.skipped}`);
+    log(`Pages processed: ${state.pagesProcessed}`);
+    log(`---------------`);
+
     chrome.runtime.sendMessage({
       type: state.stopped ? 'stopped' : 'done',
       downloaded: state.downloaded,
@@ -544,10 +1041,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       cutAds: msg.cutAds !== false,
       cutSideMenu: msg.cutSideMenu !== false,
       cutHeader: msg.cutHeader === true,
+      cutFooter: msg.cutFooter === true,
       fitOnePage: msg.fitOnePage !== false,
       excludedStatuses: msg.excludedStatuses || []
     };
-    startProcess(msg.tabId, msg.tabUrl, msg.dateFrom, msg.dateTo, msg.delay, options);
+    // delayMs is now in milliseconds directly
+    const delayMs = msg.delayMs != null ? msg.delayMs : 500;
+    startProcess(msg.tabId, msg.tabUrl, msg.dateFrom, msg.dateTo, delayMs, options);
     sendResponse({ ok: true });
   } else if (msg.action === 'stop') {
     state.stopped = true;
@@ -560,6 +1060,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       skipped: state.skipped,
       status: state.status
     });
+  } else if (msg.action === 'openFolder') {
+    // Try to open the downloads folder
+    chrome.downloads.showDefaultFolder();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'openSidePanel') {
+    // Open side panel from content script floating button
+    if (sender.tab) {
+      // Try with windowId first (more reliable), fallback to tabId
+      chrome.sidePanel.open({ windowId: sender.tab.windowId }).catch(() => {
+        chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {});
+      });
+    }
+    sendResponse({ ok: true });
   }
   return true;
 });

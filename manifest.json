@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Lazada Order PDF Downloader",
-  "version": "2.0",
+  "version": "2.3",
   "description": "Bulk download Lazada order detail pages as PDFs with date filtering, status filtering, and clean PDF output",
   "permissions": [
     "activeTab",
     "tabs",
     "scripting",
     "debugger",
-    "downloads"
+    "downloads",
+    "downloads.ui",
+    "sidePanel"
   ],
   "host_permissions": [
     "https://my.lazada.co.th/*"
@@ -23,8 +25,10 @@
       "run_at": "document_idle"
     }
   ],
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "action": {
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icon16.png",
       "48": "icon48.png",
