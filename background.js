@@ -321,13 +321,21 @@ async function extractOrdersFromPage(tabId) {
         if (seen.has(dedupeKey)) continue;
         seen.add(dedupeKey);
 
+        // Get element's vertical position so we can sort by visual order
+        const rect = shop.getBoundingClientRect();
+
         orders.push({
           shopGroupKey,
           tradeOrderId: String(tradeOrderId),
           shopName: fields.name || '',
-          status: fields.status || ''
+          status: fields.status || '',
+          top: rect.top
         });
       }
+
+      // Sort by vertical position (top-to-bottom) to match visual order on page
+      orders.sort((a, b) => a.top - b.top);
+
       return orders;
     }
   });
@@ -426,161 +434,136 @@ async function sampleDateFromPage(tabId, orders) {
   }
 }
 
-// --- Smart page finder using binary search ---
-// Orders are sorted newest-first. We want to find the first page
-// that contains orders within our date range.
-// Returns the page number to start from.
-async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
-  if (!dateTo || totalPages <= 2) return 1;
+// --- Navigate to a specific page with retry logic ---
+async function navigateToPageReliably(tabId, targetPage) {
+  const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+  const jumped = await goToPageNumber(tabId, targetPage);
+  if (!jumped) return false;
 
-  log(`Smart navigation: searching ${totalPages} pages for date range start...`);
+  let loaded = await waitForPageLoad(tabId, prevFirst);
+  if (!loaded) {
+    // Retry once
+    log(`Page ${targetPage} content did not load. Retrying...`);
+    const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+    const jumped2 = await goToPageNumber(tabId, targetPage);
+    if (jumped2) {
+      loaded = await waitForPageLoad(tabId, prevFirst2);
+    }
+  }
+  await sleep(1000);
+  return loaded;
+}
+
+// --- Get the first order's date on the current page ---
+async function getFirstOrderDate(tabId) {
+  const orders = await extractOrdersFromPage(tabId);
+  return await sampleDateFromPage(tabId, orders);
+}
+
+// --- Smart page finder using binary search ---
+// Pages are newest-first: page 1 = newest orders, page N = oldest.
+// Binary search finds the right starting page for the date range.
+// Returns one page BEFORE the range boundary so processing catches
+// all boundary orders. Processing then goes page by page (older).
+async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
+  if (totalPages <= 2) return 1;
+
+  log(`Smart navigation: searching ${totalPages} pages for date range...`);
   sendProgress('Smart navigation: finding the right page...');
 
-  // Check page 1 first - if the newest orders are already in range, start from page 1
-  const page1Orders = await extractOrdersFromPage(tabId);
-  const page1Date = await sampleDateFromPage(tabId, page1Orders);
+  // Sample page 1 (we should already be on it)
+  const page1Date = await getFirstOrderDate(tabId);
+  if (!page1Date) {
+    log('Could not read page 1 date. Starting from page 1.', 'error');
+    return 1;
+  }
 
-  if (page1Date) {
-    log(`Page 1 first order date: ${page1Date}`);
-    if (dateTo && isDateBeforeRange(page1Date, dateTo)) {
-      // Page 1 orders are AFTER our dateTo? No, isDateBeforeRange checks if date < from.
-      // We need: if page1Date > dateTo, all orders are too new... but orders are newest-first
-      // so page 1 is the newest. If page1 date is within range, start here.
+  log(`Page 1 first order date: ${page1Date}`);
+  const page1D = parseDate(page1Date);
+  if (!page1D) return 1;
+
+  const to = dateTo ? new Date(dateTo + 'T23:59:59') : null;
+  const from = dateFrom ? new Date(dateFrom + 'T00:00:00') : null;
+
+  // Safety: if page 1 date is BEFORE our range, the page is stale (left over
+  // from a previous run). Reload to get actual page 1.
+  if (from && page1D < from) {
+    log(`Page 1 date (${page1Date}) is before range start ${dateFrom}. Reloading...`, 'error');
+    await chrome.tabs.update(tabId, { url: ORDERS_URL });
+    await waitForTabLoad(tabId);
+    await sleep(2000);
+
+    const freshDate = await getFirstOrderDate(tabId);
+    if (!freshDate) return 1;
+    log(`After reload, page 1 first order date: ${freshDate}`);
+
+    const freshD = parseDate(freshDate);
+    if (!freshD) return 1;
+
+    // If still before range or within range after reload, just start from page 1
+    if (!to || freshD <= to) return 1;
+
+    // Otherwise fall through to binary search with updated date
+    // (page 1 is newer than dateTo)
+  }
+
+  // If page 1 is already within or older than dateTo, start from page 1
+  if (!to || page1D <= to) {
+    log('Page 1 is already within or past the date range. Starting from page 1.', 'success');
+    return 1;
+  }
+
+  // Page 1 is newer than dateTo → binary search for the transition page
+  log(`Page 1 (${page1Date}) is newer than ${dateTo}. Searching...`);
+
+  let lo = 2, hi = totalPages;
+
+  while (lo < hi) {
+    if (state.stopped) return 1;
+
+    const mid = Math.floor((lo + hi) / 2);
+    log(`Binary search: checking page ${mid}/${totalPages}...`);
+    sendProgress(`Smart search: page ${mid}/${totalPages}...`);
+
+    const loaded = await navigateToPageReliably(tabId, mid);
+    if (!loaded) {
+      log(`Page ${mid} unreachable. Searching left.`, 'error');
+      hi = mid;
+      continue;
     }
-    // If page 1 date is within our range, just start from page 1
-    if (isDateInRange(page1Date, dateFrom, dateTo)) {
-      log('Page 1 already contains orders in range. Starting from page 1.', 'success');
-      return 1;
+
+    const midDate = await getFirstOrderDate(tabId);
+    if (!midDate) {
+      log(`Page ${mid} date unreadable. Searching left.`, 'error');
+      hi = mid;
+      continue;
     }
-    // If page 1 date is BEFORE dateFrom, something is wrong - page 1 should be the newest.
-    // This can happen if we're not actually on page 1 (stale page from a previous run).
-    // Force reload the orders page to reset to page 1.
-    let d = parseDate(page1Date);
-    const from = dateFrom ? new Date(dateFrom + 'T00:00:00') : null;
-    const to = dateTo ? new Date(dateTo + 'T23:59:59') : null;
-    if (d && from && d < from) {
-      log(`Page 1 date (${page1Date}) is BEFORE range start ${dateFrom}. Page may be stale. Reloading...`, 'error');
-      await chrome.tabs.update(tabId, { url: ORDERS_URL });
-      await waitForTabLoad(tabId);
-      await sleep(2000);
-      // Re-check page 1 after reload
-      const freshOrders = await extractOrdersFromPage(tabId);
-      const freshDate = await sampleDateFromPage(tabId, freshOrders);
-      if (freshDate) {
-        log(`After reload, page 1 first order date: ${freshDate}`);
-        d = parseDate(freshDate); // Update d for subsequent checks
-        if (isDateInRange(freshDate, dateFrom, dateTo)) {
-          return 1;
-        }
-      }
+
+    log(`Page ${mid} first order date: ${midDate}`);
+    const midD = parseDate(midDate);
+
+    if (!midD) {
+      hi = mid;
+      continue;
     }
-    // If page 1 date is AFTER dateTo (orders newer than our range), we need to go forward
-    if (d && to && d > to) {
-      log(`Page 1 orders (${page1Date}) are newer than ${dateTo}. Searching deeper...`);
-      // Binary search: find the page where dates fall into range
-      let lo = 1, hi = totalPages;
-      while (lo < hi) {
-        const mid = Math.floor((lo + hi) / 2);
-        log(`Binary search: checking page ${mid}/${totalPages}...`);
-        sendProgress(`Smart search: checking page ${mid}/${totalPages}...`);
 
-        // Navigate to page mid
-        const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
-        const jumped = await goToPageNumber(tabId, mid);
-        let contentLoaded = false;
-        if (jumped) {
-          contentLoaded = await waitForPageLoad(tabId, prevFirst);
-          await sleep(1000);
-
-          if (!contentLoaded) {
-            // Page content didn't change - the Go button navigation likely failed.
-            // Retry: try navigating again with a fresh attempt
-            log(`Page ${mid} content did not change after navigation. Retrying...`);
-            const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
-            const jumped2 = await goToPageNumber(tabId, mid);
-            if (jumped2) {
-              contentLoaded = await waitForPageLoad(tabId, prevFirst2);
-              await sleep(1000);
-            }
-
-            if (!contentLoaded) {
-              // Last resort: full page reload with page parameter in URL
-              log(`Retry failed. Trying URL-based navigation to page ${mid}...`);
-              try {
-                const tab = await chrome.tabs.get(tabId);
-                const currentUrl = new URL(tab.url);
-                currentUrl.searchParams.set('page', String(mid));
-                await chrome.tabs.update(tabId, { url: currentUrl.toString() });
-                await waitForTabLoad(tabId);
-                await sleep(2000);
-                contentLoaded = true; // URL navigation forces full reload
-              } catch (e) {
-                log(`URL navigation failed: ${e.message}`, 'error');
-              }
-            }
-          }
-
-          if (!contentLoaded) {
-            // Still failed - don't trust this page's data
-            log(`Page ${mid} unreachable after all attempts. Skipping.`, 'error');
-            hi = mid;
-            continue;
-          }
-
-          // Verify we actually landed on the correct page
-          const pageInfo = await getPaginationInfo(tabId);
-          if (pageInfo.currentPage !== mid) {
-            log(`Navigation check: expected page ${mid}, on page ${pageInfo.currentPage}. Adjusting.`);
-            // Use the actual page we're on for the binary search decision
-            // Don't retry again - we already retried above
-          }
-        } else {
-          // Can't jump, fall back to sequential from page 1
-          log('Cannot jump to page directly. Will scan sequentially.', 'error');
-          // Navigate back to page 1
-          const pf = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
-          await goToPageNumber(tabId, 1);
-          await waitForPageLoad(tabId, pf);
-          await sleep(1000);
-          return 1;
-        }
-
-        const midOrders = await extractOrdersFromPage(tabId);
-        const midDate = await sampleDateFromPage(tabId, midOrders);
-
-        if (!midDate) {
-          // Can't determine date, be safe and go left
-          hi = mid;
-          continue;
-        }
-
-        log(`Page ${mid} first order date: ${midDate}`);
-        const midD = parseDate(midDate);
-
-        if (midD && to && midD > to) {
-          // Still too new, go right (deeper into older orders)
-          lo = mid + 1;
-        } else {
-          // This page or earlier might be our start
-          hi = mid;
-        }
-      }
-
-      // Navigate to the found page
-      // Go back one page to be safe (might have orders spanning the boundary)
-      const startPage = Math.max(1, lo - 1);
-      log(`Smart navigation: starting from page ${startPage}.`, 'success');
-
-      const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
-      await goToPageNumber(tabId, startPage);
-      await waitForPageLoad(tabId, prevFirst2);
-      await sleep(1000);
-
-      return startPage;
+    if (midD > to) {
+      // Too new → go forward (deeper, towards older pages)
+      lo = mid + 1;
+    } else {
+      // In range or too old → go back (towards newer pages)
+      hi = mid;
     }
   }
 
-  return 1;
+  // lo = first page where first order date <= dateTo
+  // Start one page before to catch boundary orders
+  const startPage = Math.max(1, lo - 1);
+  log(`Smart navigation: starting from page ${startPage}.`, 'success');
+
+  // Navigate to the start page
+  await navigateToPageReliably(tabId, startPage);
+  return startPage;
 }
 
 // --- Cleanup: DOM removal + CSS to prepare page for PDF ---
@@ -925,6 +908,12 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
   state.skipped = 0;
   state.pagesProcessed = 0;
 
+  // Safety: swap dates if from > to
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    log(`Date range "${dateFrom}" to "${dateTo}" is inverted. Swapping.`, 'error');
+    [dateFrom, dateTo] = [dateTo, dateFrom];
+  }
+
   try {
     // Step 1: Navigate to orders page if needed
     const navResult = await navigateToOrders(tabId, tabUrl);
@@ -985,14 +974,12 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
     let pageNum = startPage;
     let reachedEndOfRange = false;
 
-    // If we jumped to a page > 1, we need to navigate there
+    // findStartPage already navigated to startPage, so we're ready.
+    // But verify we're on the right page.
     if (startPage > 1) {
       const { currentPage } = await getPaginationInfo(tabId);
       if (currentPage !== startPage) {
-        const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
-        await goToPageNumber(tabId, startPage);
-        await waitForPageLoad(tabId, prevFirst);
-        await sleep(1000);
+        await navigateToPageReliably(tabId, startPage);
       }
     }
 
@@ -1020,6 +1007,10 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
         log('No orders found on this page. Stopping.');
         break;
       }
+
+      // Track per-page stats to decide when to stop
+      let pageHadInRangeOrder = false;
+      let pageHadBeforeRangeOrder = false;
 
       for (let i = 0; i < orders.length; i++) {
         if (state.stopped) break;
@@ -1076,15 +1067,17 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
           const orderDate = dateResults[0]?.result;
           log(`${orderLabel} - "${order.shopName}" placed ${orderDate || 'unknown date'}, status: ${order.status || 'unknown'}`);
 
-          // Early stop
+          // Check if before range start
           if (orderDate && isDateBeforeRange(orderDate, dateFrom)) {
-            log(`${orderLabel} - date ${orderDate} is before range start ${dateFrom}. All remaining orders are older. Stopping.`, 'success');
-            reachedEndOfRange = true;
+            pageHadBeforeRangeOrder = true;
+            log(`${orderLabel} - date ${orderDate} is before range start ${dateFrom}, skipping.`);
+            state.skipped++;
             try { await chrome.tabs.remove(detailTabId); } catch (_) {}
-            break;
+            await sleep(500);
+            continue;
           }
 
-          // Skip if outside date range
+          // Skip if outside date range (e.g. after dateTo)
           if (!isDateInRange(orderDate, dateFrom, dateTo)) {
             const reason = orderDate
               ? `date ${orderDate} outside range ${dateFrom || '*'} to ${dateTo || '*'}`
@@ -1097,9 +1090,11 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
             continue;
           }
 
-          // In range - apply CSS and print PDF
+          // In range!
+          pageHadInRangeOrder = true;
+
           await injectCleanupCSS(detailTabId, options);
-          await sleep(800); // Wait for DOM removal + CSS reflow before PDF
+          await sleep(800);
 
           const dateForFile = formatDateForFilename(orderDate);
           const shopClean = sanitizeFilename(order.shopName) || 'shop';
@@ -1130,6 +1125,15 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
 
       state.pagesProcessed++;
       sendProgress(`Completed ${pageLabel}`);
+
+      // Stop after processing ALL orders on this page if the entire page
+      // was before the date range (no in-range orders found, and at least
+      // one order was confirmed to be before dateFrom)
+      if (!pageHadInRangeOrder && pageHadBeforeRangeOrder) {
+        log(`All orders on ${pageLabel} are before ${dateFrom}. Done.`, 'success');
+        reachedEndOfRange = true;
+      }
+
       pageNum++;
     }
 
