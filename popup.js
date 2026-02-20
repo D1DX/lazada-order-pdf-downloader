@@ -323,8 +323,8 @@ chrome.runtime.onMessage.addListener((msg) => {
 startBtn.addEventListener('click', async () => {
   loginWarning.style.display = 'none';
 
-  const dateFrom = document.getElementById('dateFrom').value;
-  const dateTo = document.getElementById('dateTo').value;
+  let dateFrom = document.getElementById('dateFrom').value;
+  let dateTo = document.getElementById('dateTo').value;
   const delayMs = parseInt(document.getElementById('delay').value) || 500;
   const cutAds = document.getElementById('cutAds').checked;
   const cutSideMenu = document.getElementById('cutSideMenu').checked;
@@ -332,6 +332,14 @@ startBtn.addEventListener('click', async () => {
   const cutFooter = document.getElementById('cutFooter').checked;
   const fitOnePage = document.getElementById('fitOnePage').checked;
   const excludedStatuses = getExcludedStatuses();
+
+  // Validate date range
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    addLog(`Date range is invalid: "${dateFrom}" is after "${dateTo}". Swapping them.`, 'error');
+    [dateFrom, dateTo] = [dateTo, dateFrom];
+    document.getElementById('dateFrom').value = dateFrom;
+    document.getElementById('dateTo').value = dateTo;
+  }
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 

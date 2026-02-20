@@ -908,6 +908,12 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
   state.skipped = 0;
   state.pagesProcessed = 0;
 
+  // Safety: swap dates if from > to
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    log(`Date range "${dateFrom}" to "${dateTo}" is inverted. Swapping.`, 'error');
+    [dateFrom, dateTo] = [dateTo, dateFrom];
+  }
+
   try {
     // Step 1: Navigate to orders page if needed
     const navResult = await navigateToOrders(tabId, tabUrl);
