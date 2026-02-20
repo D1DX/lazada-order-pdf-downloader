@@ -9,10 +9,11 @@ A Chrome extension that bulk downloads your Lazada (Thailand) order detail pages
 - **Status Filter** - Exclude cancelled or other unwanted order statuses
 - **Clean PDFs** - Optionally remove ads, sidebar, and header from the PDF output
 - **Fit to One Page** - Automatically scales the order to fit on a single PDF page
+- **Smart Page Navigation** - Binary search jumps directly to the right page range instead of scanning every page
 - **Auto-Navigate** - Click Start from any page; the extension navigates to your orders page automatically
 - **Login Detection** - Detects if you need to log in and prompts you
 - **Duplicate Prevention** - Ensures each order is only downloaded once
-- **Smart Early Stop** - Stops processing when it reaches orders older than your date range
+- **Date Validation** - Auto-detects and fixes inverted date ranges
 - **Floating Button** - A convenient PDF button appears on your Lazada orders page
 
 ## Installation
@@ -33,7 +34,7 @@ A Chrome extension that bulk downloads your Lazada (Thailand) order detail pages
 4. **Click "Start Downloading PDFs"**
 5. The extension will:
    - Navigate to your Lazada orders page (if not already there)
-   - Scan each page of orders
+   - Use binary search to jump to the right page range for your dates
    - Open each order detail in a background tab
    - Clean up the page and save it as PDF
    - Move to the next order automatically
@@ -72,10 +73,29 @@ This extension only requests permissions it needs:
 
 Host permissions are limited to `https://my.lazada.co.th/*` only.
 
+## Changelog
+
+### v2.4
+- **Rebuilt smart page navigation** - Binary search reliably finds the correct page range for any date filter
+- **Fixed Go button navigation** - Uses `execCommand('insertText')` for reliable React input handling, with retry and fallback logic
+- **Per-page early stopping** - Processes all orders on each page before deciding to stop, handling mixed-date pages correctly
+- **Visual order extraction** - Orders are now sorted by their vertical position on the page to match Lazada's display order
+- **Stale page detection** - Automatically reloads if the page is left over from a previous run
+- **Date range validation** - Auto-swaps inverted date ranges instead of silently failing
+
+### v2.3
+- Side panel UI, beautiful logs, PDF layout fixes, and reliability improvements
+
+### v2.0
+- Major update with 16 improvements
+
+### v1.0
+- Initial release
+
 ## Tips
 
 - **First run**: Make sure you're logged into Lazada before starting
-- **Delay setting**: The default 3-second delay between orders prevents rate limiting. Increase it if you encounter issues
+- **Delay setting**: The default 500ms delay between orders keeps things smooth. Increase it if you encounter issues
 - **Large batches**: For downloading many orders (hundreds+), consider doing it in yearly batches
 - **Browser focus**: The extension works in the background but needs Chrome to stay open
 
@@ -87,6 +107,7 @@ Host permissions are limited to `https://my.lazada.co.th/*` only.
 | Login redirect | Log into Lazada in the same browser, then try again |
 | PDF looks wrong | Try toggling the PDF options (ads, sidebar, header removal) |
 | Extension not loading | Go to `chrome://extensions/`, remove it, and load unpacked again |
+| Wrong page after restart | The extension auto-detects stale pages and reloads — just run again |
 
 ## License
 
