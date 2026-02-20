@@ -86,7 +86,7 @@ async function goToPageNumber(tabId, targetPage) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: (target) => {
+    func: async (target) => {
       // Helper: set input value using native setter to bypass React
       function setInputValue(input, value) {
         const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -212,11 +212,14 @@ async function goToPageNumber(tabId, targetPage) {
         // Find and click the "Go" button
         const goBtn = findGoButton(goInput);
         if (goBtn) {
+          // Delay to let React process the input value change before clicking
+          await new Promise(r => setTimeout(r, 150));
           goBtn.click();
           return { ok: true, method: 'go-button', debug: `Found Go btn tag=${goBtn.tagName} text="${goBtn.textContent.trim()}"` };
         }
 
         // No Go button found - try Enter key as fallback
+        await new Promise(r => setTimeout(r, 150));
         pressEnter(goInput);
         return { ok: true, method: 'enter-key', debug: 'Go button not found, used Enter key' };
       }
@@ -230,9 +233,11 @@ async function goToPageNumber(tabId, targetPage) {
         setInputValue(jumpInput, target);
         const goBtn = findGoButton(jumpInput);
         if (goBtn) {
+          await new Promise(r => setTimeout(r, 150));
           goBtn.click();
           return { ok: true, method: 'jump-go-button' };
         }
+        await new Promise(r => setTimeout(r, 150));
         pressEnter(jumpInput);
         return { ok: true, method: 'jump-enter-key' };
       }
@@ -431,6 +436,26 @@ async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
         if (jumped) {
           await waitForPageLoad(tabId, prevFirst);
           await sleep(1000);
+
+          // Verify we actually landed on the correct page
+          const pageInfo = await getPaginationInfo(tabId);
+          if (pageInfo.currentPage !== mid) {
+            log(`Navigation check: expected page ${mid}, on page ${pageInfo.currentPage}. Retrying...`);
+            // Retry navigation once
+            const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+            const jumped2 = await goToPageNumber(tabId, mid);
+            if (jumped2) {
+              await waitForPageLoad(tabId, prevFirst2);
+              await sleep(1000);
+            }
+            const pageInfo2 = await getPaginationInfo(tabId);
+            if (pageInfo2.currentPage !== mid) {
+              log(`Page ${mid} unreachable after retry (on page ${pageInfo2.currentPage}). Skipping.`, 'error');
+              // Conservative: don't trust this page's data, search left
+              hi = mid;
+              continue;
+            }
+          }
         } else {
           // Can't jump, fall back to sequential from page 1
           log('Cannot jump to page directly. Will scan sequentially.', 'error');
