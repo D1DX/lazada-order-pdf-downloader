@@ -452,9 +452,29 @@ async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
       log('Page 1 already contains orders in range. Starting from page 1.', 'success');
       return 1;
     }
-    // If page 1 date is AFTER dateTo (orders newer than our range), we need to go forward
-    const d = parseDate(page1Date);
+    // If page 1 date is BEFORE dateFrom, something is wrong - page 1 should be the newest.
+    // This can happen if we're not actually on page 1 (stale page from a previous run).
+    // Force reload the orders page to reset to page 1.
+    let d = parseDate(page1Date);
+    const from = dateFrom ? new Date(dateFrom + 'T00:00:00') : null;
     const to = dateTo ? new Date(dateTo + 'T23:59:59') : null;
+    if (d && from && d < from) {
+      log(`Page 1 date (${page1Date}) is BEFORE range start ${dateFrom}. Page may be stale. Reloading...`, 'error');
+      await chrome.tabs.update(tabId, { url: ORDERS_URL });
+      await waitForTabLoad(tabId);
+      await sleep(2000);
+      // Re-check page 1 after reload
+      const freshOrders = await extractOrdersFromPage(tabId);
+      const freshDate = await sampleDateFromPage(tabId, freshOrders);
+      if (freshDate) {
+        log(`After reload, page 1 first order date: ${freshDate}`);
+        d = parseDate(freshDate); // Update d for subsequent checks
+        if (isDateInRange(freshDate, dateFrom, dateTo)) {
+          return 1;
+        }
+      }
+    }
+    // If page 1 date is AFTER dateTo (orders newer than our range), we need to go forward
     if (d && to && d > to) {
       log(`Page 1 orders (${page1Date}) are newer than ${dateTo}. Searching deeper...`);
       // Binary search: find the page where dates fall into range
@@ -934,6 +954,24 @@ async function startProcess(tabId, tabUrl, dateFrom, dateTo, delayMs, options) {
     log(`----------------------------`);
 
     const globalSeen = new Set();
+
+    // Always ensure we're on page 1 before starting
+    // (previous run may have left us on a different page)
+    const preInfo = await getPaginationInfo(tabId);
+    if (preInfo.currentPage !== 1) {
+      log(`Currently on page ${preInfo.currentPage}. Navigating to page 1...`);
+      const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+      await goToPageNumber(tabId, 1);
+      const loaded = await waitForPageLoad(tabId, prevFirst);
+      if (!loaded) {
+        // Force reload the orders page to get back to page 1
+        await chrome.tabs.update(tabId, { url: ORDERS_URL });
+        await waitForTabLoad(tabId);
+        await sleep(2000);
+      } else {
+        await sleep(1000);
+      }
+    }
 
     const { totalPages } = await getPaginationInfo(tabId);
     log(`Found ${totalPages} page${totalPages > 1 ? 's' : ''} of orders.`);
