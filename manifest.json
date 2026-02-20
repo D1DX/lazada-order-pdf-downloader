@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lazada Order PDF Downloader",
-  "version": "2.3",
+  "version": "2.4",
   "description": "Bulk download Lazada order detail pages as PDFs with date filtering, status filtering, and clean PDF output",
   "permissions": [
     "activeTab",
