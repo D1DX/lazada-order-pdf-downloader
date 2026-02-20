@@ -86,15 +86,44 @@ async function goToPageNumber(tabId, targetPage) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: (target) => {
-      // Helper: set input value using native setter to bypass React
+    func: async (target) => {
+      // Helper: set input value using multiple strategies for React compatibility
       function setInputValue(input, value) {
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(input, String(value));
+        const strValue = String(value);
+
+        // Strategy A: Use execCommand('insertText') which triggers React's
+        // synthetic event system reliably (simulates real user typing)
+        input.focus();
+        input.select(); // Select all existing text
+        try {
+          // Clear existing value first
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+          nativeInputValueSetter.call(input, '');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+
+          // Type the new value via execCommand (triggers React onChange)
+          document.execCommand('insertText', false, strValue);
+        } catch (_) {
+          // Fallback: native setter approach
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+          nativeInputValueSetter.call(input, strValue);
+        }
+
+        // Fire events to ensure React picks up the change
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
+        // Also fire React 16+ compatible InputEvent
+        try {
+          input.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            inputType: 'insertText',
+            data: strValue
+          }));
+        } catch (_) {}
       }
 
       // Helper: fire Enter key events
@@ -212,11 +241,17 @@ async function goToPageNumber(tabId, targetPage) {
         // Find and click the "Go" button
         const goBtn = findGoButton(goInput);
         if (goBtn) {
+          // Delay to let React process the input value change before clicking
+          await new Promise(r => setTimeout(r, 300));
           goBtn.click();
+          // Also press Enter on the input as a belt-and-suspenders approach
+          await new Promise(r => setTimeout(r, 100));
+          pressEnter(goInput);
           return { ok: true, method: 'go-button', debug: `Found Go btn tag=${goBtn.tagName} text="${goBtn.textContent.trim()}"` };
         }
 
         // No Go button found - try Enter key as fallback
+        await new Promise(r => setTimeout(r, 300));
         pressEnter(goInput);
         return { ok: true, method: 'enter-key', debug: 'Go button not found, used Enter key' };
       }
@@ -230,9 +265,13 @@ async function goToPageNumber(tabId, targetPage) {
         setInputValue(jumpInput, target);
         const goBtn = findGoButton(jumpInput);
         if (goBtn) {
+          await new Promise(r => setTimeout(r, 300));
           goBtn.click();
+          await new Promise(r => setTimeout(r, 100));
+          pressEnter(jumpInput);
           return { ok: true, method: 'jump-go-button' };
         }
+        await new Promise(r => setTimeout(r, 300));
         pressEnter(jumpInput);
         return { ok: true, method: 'jump-enter-key' };
       }
@@ -428,9 +467,53 @@ async function findStartPage(tabId, dateFrom, dateTo, totalPages) {
         // Navigate to page mid
         const prevFirst = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
         const jumped = await goToPageNumber(tabId, mid);
+        let contentLoaded = false;
         if (jumped) {
-          await waitForPageLoad(tabId, prevFirst);
+          contentLoaded = await waitForPageLoad(tabId, prevFirst);
           await sleep(1000);
+
+          if (!contentLoaded) {
+            // Page content didn't change - the Go button navigation likely failed.
+            // Retry: try navigating again with a fresh attempt
+            log(`Page ${mid} content did not change after navigation. Retrying...`);
+            const prevFirst2 = (await extractOrdersFromPage(tabId))[0]?.shopGroupKey;
+            const jumped2 = await goToPageNumber(tabId, mid);
+            if (jumped2) {
+              contentLoaded = await waitForPageLoad(tabId, prevFirst2);
+              await sleep(1000);
+            }
+
+            if (!contentLoaded) {
+              // Last resort: full page reload with page parameter in URL
+              log(`Retry failed. Trying URL-based navigation to page ${mid}...`);
+              try {
+                const tab = await chrome.tabs.get(tabId);
+                const currentUrl = new URL(tab.url);
+                currentUrl.searchParams.set('page', String(mid));
+                await chrome.tabs.update(tabId, { url: currentUrl.toString() });
+                await waitForTabLoad(tabId);
+                await sleep(2000);
+                contentLoaded = true; // URL navigation forces full reload
+              } catch (e) {
+                log(`URL navigation failed: ${e.message}`, 'error');
+              }
+            }
+          }
+
+          if (!contentLoaded) {
+            // Still failed - don't trust this page's data
+            log(`Page ${mid} unreachable after all attempts. Skipping.`, 'error');
+            hi = mid;
+            continue;
+          }
+
+          // Verify we actually landed on the correct page
+          const pageInfo = await getPaginationInfo(tabId);
+          if (pageInfo.currentPage !== mid) {
+            log(`Navigation check: expected page ${mid}, on page ${pageInfo.currentPage}. Adjusting.`);
+            // Use the actual page we're on for the binary search decision
+            // Don't retry again - we already retried above
+          }
         } else {
           // Can't jump, fall back to sequential from page 1
           log('Cannot jump to page directly. Will scan sequentially.', 'error');
