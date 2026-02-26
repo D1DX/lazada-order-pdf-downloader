@@ -1,5 +1,10 @@
 # Lazada Order PDF Downloader
 
+[![Author](https://img.shields.io/badge/Author-Daniel_Rudaev-000000?style=flat)](https://github.com/daniel-rudaev)
+[![Studio](https://img.shields.io/badge/Studio-D1DX-000000?style=flat)](https://d1dx.com)
+[![Chrome Extension](https://img.shields.io/badge/Chrome_Extension-Manifest_V3-4285F4?style=flat&logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat)](./LICENSE)
+
 A Chrome extension that bulk downloads your Lazada (Thailand) order detail pages as PDF files. No more manually opening each order and printing one by one.
 
 ## Features
