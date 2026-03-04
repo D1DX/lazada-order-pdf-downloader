@@ -5,7 +5,7 @@
     "name": "Lazada Order Pdf Downloader",
     "profile": "service-repo",
     "owner": "D1DX",
-    "root": "/Users/danielrudaev/Desktop/lazada-order-pdf-downloader",
+    "root": "/Users/danielrudaev/Desktop/.cloud-align-work/lazada-order-pdf-downloader",
     "requires_mcp_template": false
   },
   "providers": {
